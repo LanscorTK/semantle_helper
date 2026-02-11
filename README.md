@@ -1,5 +1,7 @@
 # Semantle Helper (Word2Vec)
 
+Game URL: https://semantle.com/
+
 A Semantle-focused helper that uses one approach only: **word2vec vectors via `gensim`**.
 
 This matches Semantle’s core idea (semantic distance in word2vec space) better than mixing multiple embedding systems.
