@@ -4,21 +4,25 @@ Game URL: https://semantle.com/
 
 A Semantle-focused helper that uses one approach only: **word2vec vectors via `gensim`**.
 
-This matches Semantle’s core idea (semantic distance in word2vec space) better than mixing multiple embedding systems.
+## Rank Convention Used Here
 
-## Why This Approach
+This helper follows the Semantle proximity direction you requested:
 
-Semantle states that it is based on word2vec proximity. This helper therefore uses:
-- pretrained word2vec-style vectors
-- cosine similarity between vectors
-- rank-driven clue solving (`WORD:RANK`)
-
-No alternate backend is used in this project anymore.
+- Higher rank means closer to the answer.
+- Ranked guesses are in `1..999`.
+- `999` is the hottest non-answer guess.
+- `1` is the weakest guess that still has a displayed rank.
+- If similarity is `100`, you solved the puzzle.
 
 ## Features
 
-- **Neighbor mode**: for a guessed word, return top semantic neighbors.
-- **Clue mode**: combine multiple Semantle clues (`word:rank`) and rank likely target words.
+- **Neighbor mode**: show top semantic neighbors for a word.
+- **Clue mode**: combine Semantle clues (`word:rank`) and rank likely targets.
+- **Play mode**: log guesses while playing and continuously suggest next guesses.
+- **Auto-status input**: `<word> <score>` works even when Semantle shows no rank.
+- **Amend support**: correct typo/mistake in a recorded guess.
+- **Flexible suggestions**: `suggest` defaults to 5, `suggest n` returns `n`.
+- **Readable list view**: `list` prints a table/sheet view.
 
 ## Installation
 
@@ -27,18 +31,21 @@ pip install -r requirements.txt
 ```
 
 Dependencies:
-- `gensim` for pretrained vectors
-- `numpy` for vector math
-- `wordfreq` for candidate-word pool construction
+
+- `gensim`
+- `numpy`
+- `wordfreq`
 
 ## First-Run Model Download
 
-Default model is:
+Default model:
+
 - `word2vec-google-news-300`
 
-This is large and downloaded automatically by `gensim` on first use.
+It is downloaded once by `gensim` and then cached locally.
 
-If you want smaller download size, you can use:
+Optional smaller model:
+
 - `glove-wiki-gigaword-300`
 
 Example:
@@ -55,7 +62,9 @@ python3 semantle_helper.py --gensim-model glove-wiki-gigaword-300 --word ocean
 python3 semantle_helper.py --word ocean --topk 10
 ```
 
-### 2) Clue mode (Semantle feedback)
+### 2) Clue mode
+
+Provide clues as `word:rank` where rank is `1..999` and higher is hotter:
 
 ```bash
 python3 semantle_helper.py \
@@ -65,47 +74,80 @@ python3 semantle_helper.py \
   --topk 10
 ```
 
+### 3) Play mode
+
+```bash
+python3 semantle_helper.py --play
+```
+
+You will be asked for three daily score anchors:
+
+- nearest non-answer score (rank `999`)
+- 10th-nearest non-answer score (rank `990`)
+- weakest ranked score (rank `1`)
+
+Then use commands in `play>`:
+
+- `<word> <score>`: record/update guess (status auto-inferred)
+- `<word> <score> <rank>`: record/update with explicit numeric rank (`1..999`)
+- `<word>`: show top 10 similar words
+- `<word> 100`: mark solved and end play mode
+- `amend <old_word> <new_word> <score> [rank]`: fix typo/mistake
+- `suggest`: show 5 clue-based suggestions (default)
+- `suggest <n>`: show `n` clue-based suggestions
+- `random`: show 5 random words (default)
+- `random <n>`: show `n` random words
+- `list`: show recorded guesses in table format
+- `remove <word>`: delete a recorded guess
+- `help`: show commands
+- `quit`: exit
+
+### Play-mode anchor flags
+
+```bash
+python3 semantle_helper.py --play \
+  --top999-score 52.31 \
+  --top990-score 48.92 \
+  --top1-score 36.80
+```
+
+Backward-compatible aliases are also accepted:
+
+- `--top2-score` for `--top999-score`
+- `--top10-score` for `--top990-score`
+- `--top1000-score` for `--top1-score`
+
+## Auto Status Rules (No Rank Shown)
+
+When you enter `<word> <score>`:
+
+- `far` if score `< 0`
+- `cold` if score is `0..20`
+- `tepid` if score `> 20`
+
+These are converted into coarse rank constraints and combined with other clues.
+
 ## CLI Options
 
-- `--word`: one word for neighbor suggestions
-- `--clue WORD:RANK`: Semantle proximity clue (repeat flag for multiple clues)
-- `--topk`: number of results to print (default `10`)
-- `--gensim-model`: vector model name (default `word2vec-google-news-300`)
-- `--candidate-size`: candidate pool size for clue mode (default `50000`)
-
-Notes:
-- Use either `--word` or `--clue` in a single run.
-- If no flags are given, interactive neighbor mode starts.
-
-## How Clue Mode Works
-
-Given clues like `water:45`, the helper does the following:
-
-1. Builds a candidate word pool from frequent English words (`wordfreq`) that also exist in the selected vector model.
-2. For each clue word, computes similarity from that clue to every candidate.
-3. Converts the observed Semantle rank into a target similarity band.
-4. Scores each candidate by weighted distance to those target similarity bands.
-   - Lower rank clues (hotter clues) get higher weight.
-5. Returns candidates with the best combined score.
-
-Output columns:
-- `score`: inverse-loss style score (higher is better)
-- `avg_rank_error`: average absolute rank mismatch across all clues (lower is better)
+- `--word`: neighbor query mode
+- `--clue WORD:RANK`: clue mode input (`1..999`, higher is closer)
+- `--play`: interactive play mode
+- `--suggestions`: default suggestion count in play mode (default `5`)
+- `--top999-score`, `--top990-score`, `--top1-score`: play-mode anchors
+- `--topk`: output count in neighbor/clue mode (default `10`)
+- `--gensim-model`: model name (default `word2vec-google-news-300`)
+- `--candidate-size`: clue/play candidate pool size (default `50000`)
 
 ## Caching and Performance
 
-Clue mode creates a local cache file:
+Clue/play mode caches candidate vectors in:
+
 - `semantle_candidates_<model>_<candidate_size>.npz`
 
-This stores candidate words and normalized vectors, so repeated clue solving is much faster.
-
-Performance tips:
-- Keep `--candidate-size` at `50000` for quality/speed balance.
-- Increase to `80000+` for more coverage, decrease for speed.
-- Add more high-quality clues to reduce noise in results.
+This makes repeated runs much faster.
 
 ## Limitations
 
-- This is still an approximation, not Semantle’s exact internal model/corpus.
-- Some clue words may be out-of-vocabulary depending on model.
-- Proper nouns and morphology can behave differently across models.
+- This is an approximation, not Semantle’s exact internal corpus/model.
+- OOV words may fail depending on the selected model.
+- Proper nouns and inflections can behave differently than expected.
