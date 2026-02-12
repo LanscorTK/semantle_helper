@@ -36,6 +36,10 @@ DEFAULT_PLAY_SUGGESTIONS = 5
 STATUS_LABELS = {"cold", "tepid", "far"}
 SEMANTLE_WEAKEST_RANK = 1
 SEMANTLE_HOTTEST_RANK = 999
+ONLINE_LEARNER_RIDGE = 2.0
+ONLINE_RERANK_POOL = 250
+ONLINE_ML_MIN_WEIGHT = 0.15
+ONLINE_ML_MAX_WEIGHT = 0.70
 
 
 # -------------------- Data structures --------------------
@@ -74,6 +78,57 @@ def display_rank_fields(record: GuessRecord) -> Tuple[str, str]:
     if record.status is not None:
         return "", ""
     return str(record.provided_rank_external), str(record.score_rank_external)
+
+
+@dataclass
+class OnlineTargetLearner:
+    """Lightweight online ridge learner for a latent target vector."""
+
+    dim: int
+    ridge_lambda: float = ONLINE_LEARNER_RIDGE
+
+    def __post_init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.a_inv = (np.eye(self.dim, dtype=np.float32) / float(self.ridge_lambda)).astype(np.float32)
+        self.b = np.zeros(self.dim, dtype=np.float32)
+        self.update_count = 0
+
+    def partial_fit(self, x: np.ndarray, y: float, weight: float = 1.0) -> None:
+        """One-step weighted recursive least-squares update."""
+        if weight <= 0:
+            return
+
+        x = np.asarray(x, dtype=np.float32)
+        scale = float(np.sqrt(weight))
+        xw = x * scale
+        yw = float(y) * scale
+
+        ax = self.a_inv @ xw
+        denom = float(1.0 + xw @ ax)
+        if denom <= 1e-9:
+            return
+
+        self.a_inv -= np.outer(ax, ax).astype(np.float32) / denom
+        self.b += xw * yw
+        self.update_count += 1
+
+    def target_vector(self) -> np.ndarray | None:
+        z = self.a_inv @ self.b
+        norm = float(np.linalg.norm(z))
+        if norm <= 1e-9:
+            return None
+        return (z / norm).astype(np.float32)
+
+    def confidence(self) -> float:
+        if self.update_count == 0:
+            return 0.0
+
+        sample_conf = 1.0 - float(np.exp(-self.update_count / 6.0))
+        mean_var = float(np.trace(self.a_inv)) / float(self.dim)
+        precision_conf = 1.0 / (1.0 + 8.0 * mean_var)
+        return float(np.clip(0.65 * sample_conf + 0.35 * precision_conf, 0.0, 1.0))
 
 
 # -------------------- Basic helpers --------------------
@@ -371,6 +426,74 @@ def estimate_rank_from_score(score: float, anchors: ScoreAnchors, max_external_r
     return int(np.clip(rank, SEMANTLE_WEAKEST_RANK, max_rank))
 
 
+def rank_to_unit_target(rank_external: int) -> float:
+    """Convert Semantle external rank (1..999, hotter is larger) to [-1, 1]."""
+    denom = float(SEMANTLE_HOTTEST_RANK - SEMANTLE_WEAKEST_RANK)
+    ratio = (float(rank_external) - float(SEMANTLE_WEAKEST_RANK)) / max(denom, 1e-9)
+    return float(np.clip((2.0 * ratio) - 1.0, -1.0, 1.0))
+
+
+def score_to_unit_target(score: float, anchors: ScoreAnchors, max_external_rank: int) -> float:
+    """Convert score into a rank-derived target in [-1, 1]."""
+    rank = estimate_rank_from_score(score=score, anchors=anchors, max_external_rank=max_external_rank)
+    return rank_to_unit_target(rank)
+
+
+def status_to_unit_target(status: str) -> float:
+    """Map coarse Semantle status labels onto weak regression targets."""
+    status = normalize_query(status)
+    if status == "far":
+        return -0.65
+    if status == "cold":
+        return -0.15
+    return 0.35  # tepid
+
+
+def minmax_normalize(values: np.ndarray) -> np.ndarray:
+    """Normalize a 1D array into [0, 1] with flat-array protection."""
+    if values.size == 0:
+        return values.astype(np.float32)
+
+    lo = float(np.min(values))
+    hi = float(np.max(values))
+    if hi - lo <= 1e-9:
+        return np.full(values.shape, 0.5, dtype=np.float32)
+
+    return ((values - lo) / (hi - lo)).astype(np.float32)
+
+
+def build_online_target_vector(
+    records: Dict[str, GuessRecord],
+    model,
+    anchors: ScoreAnchors,
+    max_external_rank: int,
+) -> Tuple[np.ndarray | None, float]:
+    """Fit an online target estimator from current play-mode records."""
+    learner = OnlineTargetLearner(dim=int(model.vector_size), ridge_lambda=ONLINE_LEARNER_RIDGE)
+
+    for word, rec in records.items():
+        token = resolve_gensim_token(word, model)
+        if token is None:
+            continue
+
+        vec = unit_vector(model, token)
+        score_target = score_to_unit_target(rec.score, anchors, max_external_rank)
+
+        if rec.status is None:
+            # Explicit numeric rank is strongest.
+            learner.partial_fit(vec, rank_to_unit_target(rec.provided_rank_external), weight=1.0)
+            learner.partial_fit(vec, score_target, weight=0.60)
+            if rec.score_rank_external != rec.provided_rank_external:
+                learner.partial_fit(vec, rank_to_unit_target(rec.score_rank_external), weight=0.45)
+        else:
+            # Status-only clues are weak and noisy.
+            learner.partial_fit(vec, status_to_unit_target(rec.status), weight=0.45)
+            learner.partial_fit(vec, rank_to_unit_target(rec.provided_rank_external), weight=0.25)
+            learner.partial_fit(vec, score_target, weight=0.20)
+
+    return learner.target_vector(), learner.confidence()
+
+
 def parse_rank_or_status(token: str) -> int | str:
     """Parse third field as numeric rank or status label."""
     try:
@@ -593,10 +716,15 @@ def print_play_suggestions(
     model,
     candidate_vocab: Sequence[str],
     candidate_vectors: np.ndarray,
+    anchors: ScoreAnchors,
+    max_external_rank: int,
     suggestion_count: int,
+    use_online_ml: bool,
 ) -> None:
     if not records:
+        print("-" * 60)
         print("No guesses recorded yet.")
+        print("-" * 60)
         return
 
     clues: List[Tuple[str, int, float]] = []
@@ -612,21 +740,65 @@ def print_play_suggestions(
             if rec.score_rank_external != rec.provided_rank_external:
                 clues.append((word, rec.score_rank_external, 0.35))
 
-    raw_results = solve_from_clues(
+    baseline_results = solve_from_clues(
         clues=clues,
         model=model,
         candidate_vocab=candidate_vocab,
         candidate_vectors=candidate_vectors,
-        topk=max(20, suggestion_count + 10),
+        topk=max(ONLINE_RERANK_POOL, suggestion_count + 20),
     )
 
-    print(f"\nNext {suggestion_count} suggested guesses:")
+    if not baseline_results:
+        print("No suggestions available with current clues.")
+        return
+
+    pool = [item for item in baseline_results if item[0] not in records]
+    if not pool:
+        print("No suggestions available with current clues.")
+        return
+
+    words = [word for word, _, _ in pool]
+    baseline_raw = np.asarray([score for _, score, _ in pool], dtype=np.float32)
+    avg_errs = [avg_err for _, _, avg_err in pool]
+    baseline_norm = minmax_normalize(baseline_raw)
+    ml_weight = 0.0
+    blended = baseline_norm.copy()
+
+    if use_online_ml:
+        online_vec, confidence = build_online_target_vector(
+            records=records,
+            model=model,
+            anchors=anchors,
+            max_external_rank=max_external_rank,
+        )
+        if online_vec is not None:
+            word_to_idx = {word: idx for idx, word in enumerate(candidate_vocab)}
+            indices = [word_to_idx[word] for word in words]
+            ml_raw = candidate_vectors[indices] @ online_vec
+            ml_norm = minmax_normalize(ml_raw.astype(np.float32))
+            ml_weight = ONLINE_ML_MIN_WEIGHT + (ONLINE_ML_MAX_WEIGHT - ONLINE_ML_MIN_WEIGHT) * confidence
+            blended = ((1.0 - ml_weight) * baseline_norm + ml_weight * ml_norm).astype(np.float32)
+            print()
+            print(
+                f"Next {suggestion_count} suggested guesses (hybrid: baseline+online, "
+                f"ml_weight={ml_weight:.2f}, confidence={confidence:.2f}):"
+            )
+        else:
+            print()
+            print(f"Next {suggestion_count} suggested guesses (baseline only; insufficient signal):")
+    else:
+        print()
+        print(f"Next {suggestion_count} suggested guesses (baseline only):")
+
+    order = np.argsort(-blended)
     shown = 0
-    for word, score, avg_err in raw_results:
-        if word in records:
-            continue
+    for idx in order:
+        word = words[idx]
         shown += 1
-        print(f"{shown:2d}. {word:18s} score={score:.4f}  avg_rank_error={avg_err:.1f}")
+        print(
+            f"{shown:2d}. {word:18s} score={float(blended[idx]):.4f} "
+            f"avg_rank_error={avg_errs[idx]:.1f}"
+        )
         if shown >= suggestion_count:
             break
 
@@ -641,44 +813,51 @@ def print_random_words(
 ) -> None:
     """Print random candidate words for exploration during play mode."""
     if suggestion_count <= 0:
+        print("-" * 60)
         print("Random count must be > 0.")
+        print("-" * 60)
         return
 
     available = [word for word in candidate_vocab if word not in records]
     if not available:
+        print("-" * 60)
         print("No random words available (all candidates already recorded).")
+        print("-" * 60)
         return
 
     pick_count = min(suggestion_count, len(available))
     picks = random.sample(available, k=pick_count)
 
+    print("-" * 60)
     print(f"\nRandom {pick_count} words:")
     for idx, word in enumerate(picks, start=1):
         print(f"{idx:2d}. {word}")
+    print("-" * 60)
 
 
 def print_play_records(records: Dict[str, GuessRecord]) -> None:
     if not records:
+        print("-" * 60)
         print("No guesses recorded yet.")
+        print("-" * 60)
         return
 
     rows = []
     for idx, (word, rec) in enumerate(
-        sorted(records.items(), key=lambda item: item[1].provided_rank_external, reverse=True), start=1
+        sorted(records.items(), key=lambda item: (item[1].score, item[1].provided_rank_external), reverse=True), start=1
     ):
-        rank_display, score_rank_display = display_rank_fields(rec)
+        rank_display = str(rec.provided_rank_external) if rec.status is None else "-"
         rows.append(
             (
                 str(idx),
                 word,
                 f"{rec.score:.4f}",
                 rank_display,
-                score_rank_display,
                 rec.status if rec.status else "-",
             )
         )
 
-    headers = ("#", "WORD", "SCORE", "RANK", "SCORE_RANK", "STATUS")
+    headers = ("#", "WORD", "SCORE", "RANK", "STATUS")
     widths = [len(h) for h in headers]
     for row in rows:
         for i, value in enumerate(row):
@@ -687,11 +866,13 @@ def print_play_records(records: Dict[str, GuessRecord]) -> None:
     def fmt(row: tuple[str, ...]) -> str:
         return " | ".join(value.ljust(widths[i]) for i, value in enumerate(row))
 
+    print("=" * 60)
     print("\nRecorded guesses:")
     print(fmt(headers))
     print("-+-".join("-" * w for w in widths))
     for row in rows:
         print(fmt(row))
+    print("=" * 60)
 
 
 def parse_play_record(raw: str) -> Tuple[str, float, int | str] | None:
@@ -761,6 +942,7 @@ def run_play_mode(
     candidate_size: int,
     anchors: ScoreAnchors,
     suggestion_count: int,
+    use_online_ml: bool,
 ) -> None:
     candidate_vocab, candidate_vectors = load_or_create_candidate_matrix(
         model=model,
@@ -772,20 +954,20 @@ def run_play_mode(
     records: Dict[str, GuessRecord] = {}
 
     print("\nPlay mode started.")
+    print("=" * 60)
     print(
         "Enter guesses as: <word> <score> (auto status) or <word> <score> <rank>. "
         "Commands: suggest, random, list, amend <old> <new> <score> [rank], remove <word>, help, quit"
     )
-    print("Auto status rules when no rank is shown: far(score<0), cold(0..20), tepid(>20)")
+    print("Auto status rules when no rank is shown: far(score < 0), cold(0 < score < 20), tepid(score > 20)")
     print("Type a single word to see its top 10 similar words.")
     print("If a guess has score 100, type '<word> 100' or '<word> 100 <rank>' to end.")
     print(
         "Ranking note: higher rank means closer; rank 999 is hottest non-answer, rank 1 is the edge of top-1000."
     )
-    print(
-        f"Using anchors: rank999={anchors.top2}, rank990={anchors.top10}, rank1={anchors.top1000}"
-    )
-
+    print(f"Online learner: {'enabled' if use_online_ml else 'disabled'}\n")
+    print("=" * 60)
+    
     while True:
         raw = input("play> ").strip()
         if not raw:
@@ -797,6 +979,7 @@ def run_play_mode(
             break
 
         if lower in {"help", "?"}:
+            print("-" * 60)
             print("Commands:")
             print("- <word> <score>                   add/update guess (auto status) and get suggestions")
             print("- <word> <score> <rank>            add/update guess with explicit numeric rank")
@@ -805,11 +988,12 @@ def run_play_mode(
             print("- amend <old> <new> <score> [rank] fix typos/mistakes")
             print("  auto status rules: far(score<0), cold(0..20), tepid(>20)")
             print("  rank note: higher rank is hotter; valid explicit rank is 1..999")
-            print("- suggest [n]                      show clue-based suggestions (default 5)")
+            print("- suggest [n]                      show clue+online-ml suggestions (default 5)")
             print("- random [n]                       show random words (default 5)")
             print("- list                             show recorded guesses")
             print("- remove <word>                    remove a recorded guess")
             print("- quit                             exit play mode")
+            print("-" * 60)
             continue
 
         if lower == "suggest" or lower.startswith("suggest "):
@@ -820,13 +1004,19 @@ def run_play_mode(
                 try:
                     suggest_n = int(suggest_parts[1])
                 except ValueError:
+                    print("-" * 60)
                     print("Usage: suggest [n]")
+                    print("-" * 60)
                     continue
                 if suggest_n <= 0:
+                    print("-" * 60)
                     print("Usage: suggest [n] with n > 0")
+                    print("-" * 60)
                     continue
             else:
+                print("-" * 60)
                 print("Usage: suggest [n]")
+                print("-" * 60)
                 continue
 
             print_play_suggestions(
@@ -834,7 +1024,10 @@ def run_play_mode(
                 model=model,
                 candidate_vocab=candidate_vocab,
                 candidate_vectors=candidate_vectors,
+                anchors=anchors,
+                max_external_rank=max_external_rank,
                 suggestion_count=suggest_n,
+                use_online_ml=use_online_ml,
             )
             continue
 
@@ -846,13 +1039,19 @@ def run_play_mode(
                 try:
                     random_n = int(random_parts[1])
                 except ValueError:
+                    print("-" * 60)
                     print("Usage: random [n]")
+                    print("-" * 60)
                     continue
                 if random_n <= 0:
+                    print("-" * 60)
                     print("Usage: random [n] with n > 0")
+                    print("-" * 60)
                     continue
             else:
+                print("-" * 60)
                 print("Usage: random [n]")
+                print("-" * 60)
                 continue
 
             print_random_words(
@@ -870,38 +1069,54 @@ def run_play_mode(
             to_remove = normalize_query(raw.split(maxsplit=1)[1])
             if to_remove in records:
                 del records[to_remove]
+                print("-" * 60)
                 print(f"Removed '{to_remove}'.")
+                print("-" * 60)
             else:
+                print("-" * 60)
                 print(f"'{to_remove}' not found in records.")
+                print("-" * 60)
             continue
 
         if lower.startswith("amend "):
             parts = raw.split()
             if len(parts) not in {4, 5}:
+                print("-" * 60)
                 print("Usage: amend <old_word> <new_word> <score> [rank]")
+                print("-" * 60)
                 continue
 
             old_word = normalize_query(parts[1])
             new_word = normalize_query(parts[2])
 
             if old_word not in records:
+                print("-" * 60)
                 print(f"'{old_word}' is not in recorded guesses.")
+                print("-" * 60)
                 continue
             if not is_clean_word(new_word):
+                print("-" * 60)
                 print("Invalid new word format. Use alphabetic words only.")
+                print("-" * 60)
                 continue
             if resolve_gensim_token(new_word, model) is None:
+                print("-" * 60)
                 print(f"'{new_word}' is not in the selected model vocabulary.")
+                print("-" * 60)
                 continue
 
             try:
                 score = float(parts[3])
             except ValueError:
+                print("-" * 60)
                 print("Invalid score. Use a numeric similarity score.")
+                print("-" * 60)
                 continue
 
             if np.isclose(score, 100.0):
+                print("-" * 60)
                 print(f"Solved! '{new_word}' has similarity 100. Ending play mode.")
+                print("-" * 60)
                 break
 
             try:
@@ -922,25 +1137,32 @@ def run_play_mode(
                 continue
 
             if old_word != new_word and new_word in records:
+                print("-" * 60)
                 print(f"Note: '{new_word}' already exists and will be replaced.")
+                print("-" * 60)
                 del records[new_word]
 
             del records[old_word]
             records[new_word] = new_record
 
             rank_display, score_rank_display = display_rank_fields(new_record)
+            print("-" * 60)
             status_suffix = f" status={new_record.status}" if new_record.status else ""
             print(
                 f"Amended: {old_word} -> {new_word} score={new_record.score:.4f} "
                 f"rank={rank_display} score_rank={score_rank_display}{status_suffix}"
             )
+            print("-" * 60)
 
             print_play_suggestions(
                 records=records,
                 model=model,
                 candidate_vocab=candidate_vocab,
                 candidate_vectors=candidate_vectors,
+                anchors=anchors,
+                max_external_rank=max_external_rank,
                 suggestion_count=suggestion_count,
+                use_online_ml=use_online_ml,
             )
             continue
 
@@ -949,7 +1171,9 @@ def run_play_mode(
         if len(parts) == 1:
             probe = normalize_query(parts[0])
             if not is_clean_word(probe):
+                print("-" * 60)
                 print("Invalid input. Use: <word> <score> or <word> <score> <rank> (or type 'help').")
+                print("-" * 60)
                 continue
             run_neighbor_query(probe, 10, model)
             continue
@@ -957,20 +1181,28 @@ def run_play_mode(
         if len(parts) == 2:
             word = normalize_query(parts[0])
             if not is_clean_word(word):
+                print("-" * 60)
                 print("Invalid word format. Use alphabetic words only.")
+                print("-" * 60)
                 continue
             if resolve_gensim_token(word, model) is None:
+                print("-" * 60)
                 print(f"'{word}' is not in the selected model vocabulary.")
+                print("-" * 60)
                 continue
 
             try:
                 score = float(parts[1])
             except ValueError:
+                print("-" * 60)
                 print("Invalid score. Use a numeric similarity score.")
+                print("-" * 60)
                 continue
 
             if np.isclose(score, 100.0):
+                print("-" * 60)
                 print(f"Solved! '{word}' has similarity 100. Ending play mode.")
+                print("-" * 60)
                 break
 
             auto_status = infer_status_from_score(score)
@@ -984,17 +1216,21 @@ def run_play_mode(
 
             records[word] = record
             rank_display, score_rank_display = display_rank_fields(record)
+            print("-" * 60)
             print(
-                f"Recorded: {word} score={record.score:.4f} rank={rank_display} "
-                f"score_rank={score_rank_display} status={record.status}"
+                f"Recorded: {word}"
             )
+            print("-" * 60)
 
             print_play_suggestions(
                 records=records,
                 model=model,
                 candidate_vocab=candidate_vocab,
                 candidate_vectors=candidate_vectors,
+                anchors=anchors,
+                max_external_rank=max_external_rank,
                 suggestion_count=suggestion_count,
+                use_online_ml=use_online_ml,
             )
             continue
 
@@ -1005,17 +1241,23 @@ def run_play_mode(
             continue
 
         if parsed is None:
+            print("-" * 60)
             print("Invalid input. Use: <word> <score> or <word> <score> <rank> (or type 'help').")
+            print("-" * 60)
             continue
 
         word, score, rank_or_status = parsed
 
         if resolve_gensim_token(word, model) is None:
+            print("-" * 60)
             print(f"'{word}' is not in the selected model vocabulary.")
+            print("-" * 60)
             continue
 
         if np.isclose(score, 100.0):
+            print("-" * 60)
             print(f"Solved! '{word}' has similarity 100. Ending play mode.")
+            print("-" * 60)
             break
 
         try:
@@ -1034,17 +1276,22 @@ def run_play_mode(
 
         rank_display, score_rank_display = display_rank_fields(record)
         status_suffix = f" status={record.status}" if record.status else ""
+        print("-" * 60)
         print(
             f"Recorded: {word} score={record.score:.4f} rank={rank_display} "
             f"score_rank={score_rank_display}{status_suffix}"
         )
+        print("-" * 60)
 
         print_play_suggestions(
             records=records,
             model=model,
             candidate_vocab=candidate_vocab,
             candidate_vectors=candidate_vectors,
+            anchors=anchors,
+            max_external_rank=max_external_rank,
             suggestion_count=suggestion_count,
+            use_online_ml=use_online_ml,
         )
 
 
@@ -1071,6 +1318,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_PLAY_SUGGESTIONS,
         help="Number of next-guess suggestions in play mode.",
+    )
+    parser.add_argument(
+        "--no-online-ml",
+        action="store_true",
+        help="Disable online learner blending in play-mode suggestions.",
     )
     parser.add_argument(
         "--top999-score",
@@ -1136,6 +1388,7 @@ def main() -> None:
             candidate_size=args.candidate_size,
             anchors=anchors,
             suggestion_count=args.suggestions,
+            use_online_ml=not args.no_online_ml,
         )
         return
 

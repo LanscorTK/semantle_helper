@@ -19,6 +19,7 @@ This helper follows the Semantle proximity direction you requested:
 - **Neighbor mode**: show top semantic neighbors for a word.
 - **Clue mode**: combine Semantle clues (`word:rank`) and rank likely targets.
 - **Play mode**: log guesses while playing and continuously suggest next guesses.
+- **Online learner (ML)**: updates after each input and blends learned target estimates with clue-based ranking.
 - **Auto-status input**: `<word> <score>` works even when Semantle shows no rank.
 - **Amend support**: correct typo/mistake in a recorded guess.
 - **Flexible suggestions**: `suggest` defaults to 5, `suggest n` returns `n`.
@@ -93,8 +94,8 @@ Then use commands in `play>`:
 - `<word>`: show top 10 similar words
 - `<word> 100`: mark solved and end play mode
 - `amend <old_word> <new_word> <score> [rank]`: fix typo/mistake
-- `suggest`: show 5 clue-based suggestions (default)
-- `suggest <n>`: show `n` clue-based suggestions
+- `suggest`: show 5 hybrid suggestions (clue solver + online learner)
+- `suggest <n>`: show `n` hybrid suggestions
 - `random`: show 5 random words (default)
 - `random <n>`: show `n` random words
 - `list`: show recorded guesses in table format
@@ -127,12 +128,28 @@ When you enter `<word> <score>`:
 
 These are converted into coarse rank constraints and combined with other clues.
 
+## Online Learner (ML)
+
+During play mode, each new guess is used as a training signal for a lightweight online model:
+
+- Numeric rank clues are treated as strong supervision.
+- Score-derived rank estimates are treated as medium supervision.
+- Status-only clues (`far/cold/tepid`) are treated as weak supervision.
+
+On every `suggest` call, the helper blends:
+
+- baseline clue solver score
+- online-learner similarity score
+
+The blend weight is confidence-based, so the model relies more on online learning as more inputs are recorded.
+
 ## CLI Options
 
 - `--word`: neighbor query mode
 - `--clue WORD:RANK`: clue mode input (`1..999`, higher is closer)
 - `--play`: interactive play mode
 - `--suggestions`: default suggestion count in play mode (default `5`)
+- `--no-online-ml`: disable online learner blending and use baseline solver only
 - `--top999-score`, `--top990-score`, `--top1-score`: play-mode anchors
 - `--topk`: output count in neighbor/clue mode (default `10`)
 - `--gensim-model`: model name (default `word2vec-google-news-300`)
