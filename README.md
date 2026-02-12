@@ -9,7 +9,7 @@ A Semantle-focused helper that uses one approach only: **word2vec vectors via `g
 This helper follows the Semantle proximity direction you requested:
 
 - Higher rank means closer to the answer.
-- Ranked guesses are in `1..999`.
+- Ranked guesses are in `1-999`.
 - `999` is the hottest non-answer guess.
 - `1` is the weakest guess that still has a displayed rank.
 - If similarity is `100`, you solved the puzzle.
@@ -65,7 +65,7 @@ python3 semantle_helper.py --word ocean --topk 10
 
 ### 2) Clue mode
 
-Provide clues as `word:rank` where rank is `1..999` and higher is hotter:
+Provide clues as `word:rank` where rank is `1-999` and higher is hotter:
 
 ```bash
 python3 semantle_helper.py \
@@ -90,7 +90,7 @@ You will be asked for three daily score anchors:
 Then use commands in `play>`:
 
 - `<word> <score>`: record/update guess (status auto-inferred)
-- `<word> <score> <rank>`: record/update with explicit numeric rank (`1..999`)
+- `<word> <score> <rank>`: record/update with explicit numeric rank (`1-999`)
 - `<word>`: show top 10 similar words
 - `<word> 100`: mark solved and end play mode
 - `amend <old_word> <new_word> <score> [rank]`: fix typo/mistake
@@ -123,7 +123,7 @@ Backward-compatible aliases are also accepted:
 When you enter `<word> <score>`:
 
 - `far` if score `< 0`
-- `cold` if score is `0..20`
+- `cold` if score is `0-20`
 - `tepid` if score `> 20`
 
 These are converted into coarse rank constraints and combined with other clues.
@@ -146,7 +146,7 @@ The blend weight is confidence-based, so the model relies more on online learnin
 ## CLI Options
 
 - `--word`: neighbor query mode
-- `--clue WORD:RANK`: clue mode input (`1..999`, higher is closer)
+- `--clue WORD:RANK`: clue mode input (`1-999`, higher is closer)
 - `--play`: interactive play mode
 - `--suggestions`: default suggestion count in play mode (default `5`)
 - `--no-online-ml`: disable online learner blending and use baseline solver only

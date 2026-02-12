@@ -1116,7 +1116,7 @@ def run_play_mode(
             if np.isclose(score, 100.0):
                 print("-" * 60)
                 print(f"Solved! '{new_word}' has similarity 100. Ending play mode.")
-                print("-" * 60)
+                print("=" * 60)
                 break
 
             try:
